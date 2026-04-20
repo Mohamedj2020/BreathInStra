@@ -1,0 +1,344 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Breath Instrument</title>
+  <script src="https://unpkg.com/tone@14.8.49/build/Tone.js"></script>
+  <style>
+    :root {
+      --black: #030303;
+      --white: #f7f7f2;
+      --soft: rgba(247, 247, 242, 0.72);
+      --glow: rgba(159, 229, 213, 0.42);
+      --breath: #9fe5d5;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: var(--black);
+      color: var(--white);
+      font-family: "Trebuchet MS", Verdana, sans-serif;
+    }
+
+    body {
+      display: grid;
+      place-items: center;
+    }
+
+    .stage {
+      position: fixed;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      background:
+        radial-gradient(circle at center, rgba(159, 229, 213, 0.08), transparent 32%),
+        #030303;
+    }
+
+    .breath-circle {
+      width: 22vmin;
+      height: 22vmin;
+      min-width: 110px;
+      min-height: 110px;
+      max-width: 260px;
+      max-height: 260px;
+      border-radius: 50%;
+      background: var(--breath);
+      opacity: 0.32;
+      transform: scale(0.72);
+      box-shadow:
+        0 0 32px var(--glow),
+        0 0 120px rgba(159, 229, 213, 0.18);
+      transition: opacity 120ms linear, transform 120ms linear, box-shadow 120ms linear;
+      will-change: opacity, transform, box-shadow;
+    }
+
+    .controls {
+      position: fixed;
+      inset: 0;
+      display: grid;
+      place-items: center;
+      padding: 24px;
+      text-align: center;
+      background: rgba(3, 3, 3, 0.84);
+    }
+
+    .panel {
+      width: min(92vw, 460px);
+    }
+
+    h1 {
+      margin: 0 0 14px;
+      font-size: 34px;
+      font-weight: 400;
+      letter-spacing: 0;
+    }
+
+    p {
+      margin: 0;
+      color: var(--soft);
+      font-size: 16px;
+      line-height: 1.5;
+    }
+
+    button {
+      min-width: 140px;
+      min-height: 48px;
+      padding: 12px 18px;
+      border: 1px solid rgba(247, 247, 242, 0.76);
+      border-radius: 6px;
+      background: transparent;
+      color: var(--white);
+      font: inherit;
+      font-size: 15px;
+      cursor: pointer;
+    }
+
+    button:hover,
+    button:focus-visible {
+      background: rgba(247, 247, 242, 0.12);
+      outline: none;
+    }
+
+    button:disabled {
+      cursor: default;
+      opacity: 0.54;
+    }
+
+    .start-action {
+      margin-top: 26px;
+    }
+
+    .fullscreen-control {
+      position: fixed;
+      top: 16px;
+      right: 16px;
+      min-width: 118px;
+      min-height: 42px;
+      color: rgba(247, 247, 242, 0.72);
+      border-color: rgba(247, 247, 242, 0.42);
+      background: rgba(3, 3, 3, 0.22);
+    }
+
+    .status {
+      position: fixed;
+      left: 18px;
+      bottom: 16px;
+      max-width: calc(100vw - 36px);
+      color: rgba(247, 247, 242, 0.58);
+      font-size: 13px;
+      line-height: 1.4;
+      letter-spacing: 0;
+    }
+
+    .hidden {
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 260ms ease;
+    }
+  </style>
+</head>
+<body>
+  <main class="stage" aria-label="Breath instrument">
+    <div id="breathCircle" class="breath-circle"></div>
+  </main>
+
+  <section id="controls" class="controls">
+    <div class="panel">
+      <h1>Breath Instrument</h1>
+      <p>Use breath as pressure. Softer air stays low and quiet. Stronger air rises.</p>
+      <button id="startButton" class="start-action">Start Audio</button>
+    </div>
+  </section>
+
+  <button id="fullscreenButton" class="fullscreen-control" type="button">Fullscreen</button>
+  <div id="status" class="status">Waiting.</div>
+
+  <script>
+    const startButton = document.getElementById("startButton");
+    const fullscreenButton = document.getElementById("fullscreenButton");
+    const controls = document.getElementById("controls");
+    const statusText = document.getElementById("status");
+    const breathCircle = document.getElementById("breathCircle");
+
+    const config = {
+      thresholdOn: 0.055,
+      thresholdOff: 0.038,
+      volumeSmoothing: 0.12,
+      visualSmoothing: 0.16,
+      minFrequency: 120,
+      maxFrequency: 760,
+      minSynthVolume: -34,
+      maxSynthVolume: -10,
+      reverbWet: 0.18
+    };
+
+    let mic;
+    let analyser;
+    let synth;
+    let reverb;
+    let animationId = null;
+    let isBlowing = false;
+    let smoothedVolume = 0;
+    let visualVolume = 0;
+
+    startButton.addEventListener("click", startAudio);
+    fullscreenButton.addEventListener("click", enterFullscreen);
+
+    async function startAudio() {
+      startButton.disabled = true;
+      statusText.textContent = "Requesting microphone.";
+
+      try {
+        await Tone.start();
+
+        mic = new Tone.UserMedia();
+        await mic.open();
+
+        analyser = new Tone.Analyser("waveform", 1024);
+        mic.connect(analyser);
+
+        reverb = new Tone.Reverb({
+          decay: 2.4,
+          preDelay: 0.02,
+          wet: config.reverbWet
+        }).toDestination();
+
+        synth = new Tone.Synth({
+          oscillator: {
+            type: "sine"
+          },
+          envelope: {
+            attack: 0.18,
+            decay: 0.05,
+            sustain: 1,
+            release: 0.42
+          }
+        }).connect(reverb);
+
+        synth.volume.value = config.minSynthVolume;
+        controls.classList.add("hidden");
+        statusText.textContent = "Listening.";
+        animationId = requestAnimationFrame(update);
+      } catch (error) {
+        startButton.disabled = false;
+        statusText.textContent = "Microphone unavailable: " + error.message;
+      }
+    }
+
+    function update() {
+      const rawVolume = getVolumeFromWaveform(analyser.getValue());
+      smoothedVolume = smooth(smoothedVolume, rawVolume, config.volumeSmoothing);
+      visualVolume = smooth(visualVolume, smoothedVolume, config.visualSmoothing);
+
+      updateSound(smoothedVolume);
+      updateVisual(visualVolume);
+
+      animationId = requestAnimationFrame(update);
+    }
+
+    function updateSound(volume) {
+      const breath = normalizeBreath(volume);
+      const now = Tone.now();
+
+      if (!isBlowing && volume >= config.thresholdOn) {
+        isBlowing = true;
+        synth.triggerAttack(volumeToFrequency(breath), now);
+      }
+
+      if (isBlowing && volume <= config.thresholdOff) {
+        isBlowing = false;
+        synth.triggerRelease(now);
+      }
+
+      if (isBlowing) {
+        const frequency = volumeToFrequency(breath);
+        const synthVolume = volumeToDecibels(breath);
+
+        synth.frequency.rampTo(frequency, 0.08);
+        synth.volume.rampTo(synthVolume, 0.08);
+        statusText.textContent = "Breath " + Math.round(breath * 100) + "% / " + Math.round(frequency) + " Hz";
+      } else {
+        statusText.textContent = "Listening.";
+      }
+    }
+
+    function updateVisual(volume) {
+      const breath = normalizeBreath(volume);
+      const scale = 0.72 + breath * 3.1;
+      const opacity = 0.22 + breath * 0.72;
+      const glow = 24 + breath * 170;
+
+      breathCircle.style.transform = "scale(" + scale.toFixed(3) + ")";
+      breathCircle.style.opacity = opacity.toFixed(3);
+      breathCircle.style.boxShadow =
+        "0 0 " + glow.toFixed(0) + "px rgba(159, 229, 213, 0.42), " +
+        "0 0 " + (glow * 2.4).toFixed(0) + "px rgba(159, 229, 213, 0.16)";
+    }
+
+    function getVolumeFromWaveform(waveform) {
+      let sum = 0;
+
+      for (let i = 0; i < waveform.length; i++) {
+        sum += waveform[i] * waveform[i];
+      }
+
+      return Math.sqrt(sum / waveform.length);
+    }
+
+    function normalizeBreath(volume) {
+      return clamp((volume - config.thresholdOff) / 0.22, 0, 1);
+    }
+
+    function volumeToFrequency(volume) {
+      const curved = volume * volume;
+      return config.minFrequency + curved * (config.maxFrequency - config.minFrequency);
+    }
+
+    function volumeToDecibels(volume) {
+      return config.minSynthVolume + volume * (config.maxSynthVolume - config.minSynthVolume);
+    }
+
+    function smooth(current, next, amount) {
+      return current + (next - current) * amount;
+    }
+
+    function clamp(value, min, max) {
+      return Math.min(Math.max(value, min), max);
+    }
+
+    async function enterFullscreen() {
+      if (!document.fullscreenElement) {
+        await document.documentElement.requestFullscreen();
+      }
+    }
+
+    window.addEventListener("beforeunload", () => {
+      if (animationId) {
+        cancelAnimationFrame(animationId);
+      }
+
+      if (mic) {
+        mic.close();
+      }
+
+      if (synth) {
+        synth.dispose();
+      }
+
+      if (reverb) {
+        reverb.dispose();
+      }
+    });
+  </script>
+</body>
+</html>
