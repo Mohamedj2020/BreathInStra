@@ -12,6 +12,8 @@
       --soft: rgba(247, 247, 242, 0.72);
       --glow: rgba(159, 229, 213, 0.42);
       --breath: #9fe5d5;
+      --zone-line: rgba(247, 247, 242, 0.12);
+      --zone-active: rgba(159, 229, 213, 0.16);
     }
 
     * {
@@ -39,9 +41,35 @@
       inset: 0;
       display: grid;
       place-items: center;
-      background:
-        radial-gradient(circle at center, rgba(159, 229, 213, 0.08), transparent 32%),
-        #030303;
+      background: #030303;
+    }
+
+    .zones {
+      position: fixed;
+      inset: 0;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      pointer-events: none;
+    }
+
+    .zone {
+      display: grid;
+      place-items: end center;
+      padding-bottom: 56px;
+      border-right: 1px solid var(--zone-line);
+      color: rgba(247, 247, 242, 0.34);
+      font-size: 13px;
+      letter-spacing: 0;
+      transition: background 140ms linear, color 140ms linear;
+    }
+
+    .zone:last-child {
+      border-right: 0;
+    }
+
+    .zone.active {
+      background: var(--zone-active);
+      color: rgba(247, 247, 242, 0.72);
     }
 
     .breath-circle {
@@ -149,13 +177,18 @@
 </head>
 <body>
   <main class="stage" aria-label="Breath instrument">
+    <div class="zones" aria-hidden="true">
+      <div class="zone" data-zone="0">Low</div>
+      <div class="zone active" data-zone="1">Mid</div>
+      <div class="zone" data-zone="2">High</div>
+    </div>
     <div id="breathCircle" class="breath-circle"></div>
   </main>
 
   <section id="controls" class="controls">
     <div class="panel">
       <h1>Breath Instrument</h1>
-      <p>Use breath as pressure. Softer air stays low and quiet. Stronger air rises.</p>
+      <p>Blow to play. Move the cursor left, middle, or right to choose the note.</p>
       <button id="startButton" class="start-action">Start Audio</button>
     </div>
   </section>
@@ -169,17 +202,26 @@
     const controls = document.getElementById("controls");
     const statusText = document.getElementById("status");
     const breathCircle = document.getElementById("breathCircle");
+    const zoneElements = Array.from(document.querySelectorAll(".zone"));
 
     const config = {
       thresholdOn: 0.055,
       thresholdOff: 0.038,
       volumeSmoothing: 0.12,
       visualSmoothing: 0.16,
-      minFrequency: 120,
-      maxFrequency: 760,
       minSynthVolume: -34,
       maxSynthVolume: -10,
-      reverbWet: 0.18
+      reverbWet: 0.18,
+      gateOnMs: 45,
+      gateHoldMs: 70,
+      noteRampTime: 0.11,
+      volumeRampTime: 0.08,
+      zoneHysteresisPx: 18,
+      notes: [
+        { label: "Low", note: "C3" },
+        { label: "Mid", note: "G3" },
+        { label: "High", note: "C4" }
+      ]
     };
 
     let mic;
@@ -190,15 +232,34 @@
     let isBlowing = false;
     let smoothedVolume = 0;
     let visualVolume = 0;
+    let activeZone = 1;
+    let targetFrequency = noteToFrequency(config.notes[activeZone].note);
+    let lastSynthVolume = config.minSynthVolume;
+    let lastPointerX = window.innerWidth / 2;
+    let loudSince = null;
+    let quietSince = null;
 
     startButton.addEventListener("click", startAudio);
     fullscreenButton.addEventListener("click", enterFullscreen);
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("resize", () => {
+      const width = window.innerWidth || document.documentElement.clientWidth;
+      setActiveZone(getZoneFromX(lastPointerX, width));
+    });
 
     async function startAudio() {
       startButton.disabled = true;
       statusText.textContent = "Requesting microphone.";
 
       try {
+        if (!navigator.mediaDevices && window.location.protocol !== "file:") {
+          throw new Error("Microphone access needs HTTPS or http://localhost.");
+        }
+
+        if (!window.isSecureContext && window.location.protocol !== "file:") {
+          throw new Error("Microphone access needs HTTPS or http://localhost.");
+        }
+
         await Tone.start();
 
         mic = new Tone.UserMedia();
@@ -212,6 +273,9 @@
           preDelay: 0.02,
           wet: config.reverbWet
         }).toDestination();
+        if (typeof reverb.generate === "function") {
+          await reverb.generate();
+        }
 
         synth = new Tone.Synth({
           oscillator: {
@@ -250,25 +314,103 @@
       const breath = normalizeBreath(volume);
       const now = Tone.now();
 
-      if (!isBlowing && volume >= config.thresholdOn) {
-        isBlowing = true;
-        synth.triggerAttack(volumeToFrequency(breath), now);
+      if (!isBlowing && volume >= config.thresholdOn && loudSince === null) {
+        loudSince = performance.now();
       }
 
-      if (isBlowing && volume <= config.thresholdOff) {
+      if (!isBlowing && volume < config.thresholdOn) {
+        loudSince = null;
+      }
+
+      if (!isBlowing && loudSince !== null && performance.now() - loudSince >= config.gateOnMs) {
+        isBlowing = true;
+        loudSince = null;
+        quietSince = null;
+        synth.triggerAttack(targetFrequency, now);
+      }
+
+      if (isBlowing && volume <= config.thresholdOff && quietSince === null) {
+        quietSince = performance.now();
+      }
+
+      if (isBlowing && volume > config.thresholdOff) {
+        quietSince = null;
+      }
+
+      if (isBlowing && quietSince !== null && performance.now() - quietSince >= config.gateHoldMs) {
         isBlowing = false;
+        quietSince = null;
         synth.triggerRelease(now);
       }
 
       if (isBlowing) {
-        const frequency = volumeToFrequency(breath);
         const synthVolume = volumeToDecibels(breath);
 
-        synth.frequency.rampTo(frequency, 0.08);
-        synth.volume.rampTo(synthVolume, 0.08);
-        statusText.textContent = "Breath " + Math.round(breath * 100) + "% / " + Math.round(frequency) + " Hz";
+        if (Math.abs(synthVolume - lastSynthVolume) > 0.2) {
+          synth.volume.rampTo(synthVolume, config.volumeRampTime);
+          lastSynthVolume = synthVolume;
+        }
+
+        statusText.textContent =
+          "Breath " + Math.round(breath * 100) + "% / " +
+          config.notes[activeZone].label + " " +
+          config.notes[activeZone].note;
       } else {
-        statusText.textContent = "Listening.";
+        statusText.textContent =
+          "Listening. Valve: " +
+          config.notes[activeZone].label + " " +
+          config.notes[activeZone].note;
+      }
+    }
+
+    function handlePointerMove(event) {
+      const width = window.innerWidth || document.documentElement.clientWidth;
+      lastPointerX = event.clientX;
+      const zone = getZoneFromX(event.clientX, width);
+      setActiveZone(zone);
+    }
+
+    function getZoneFromX(x, width) {
+      const third = width / 3;
+      const leftBoundary = third;
+      const rightBoundary = third * 2;
+      const margin = config.zoneHysteresisPx;
+
+      if (activeZone === 0 && x > leftBoundary + margin) {
+        return x > rightBoundary + margin ? 2 : 1;
+      }
+
+      if (activeZone === 1) {
+        if (x < leftBoundary - margin) {
+          return 0;
+        }
+
+        if (x > rightBoundary + margin) {
+          return 2;
+        }
+      }
+
+      if (activeZone === 2 && x < rightBoundary - margin) {
+        return x < leftBoundary - margin ? 0 : 1;
+      }
+
+      return activeZone;
+    }
+
+    function setActiveZone(zone) {
+      if (zone === activeZone) {
+        return;
+      }
+
+      activeZone = zone;
+      targetFrequency = noteToFrequency(config.notes[activeZone].note);
+
+      zoneElements.forEach((element, index) => {
+        element.classList.toggle("active", index === activeZone);
+      });
+
+      if (isBlowing && synth) {
+        synth.frequency.rampTo(targetFrequency, config.noteRampTime);
       }
     }
 
@@ -299,13 +441,12 @@
       return clamp((volume - config.thresholdOff) / 0.22, 0, 1);
     }
 
-    function volumeToFrequency(volume) {
-      const curved = volume * volume;
-      return config.minFrequency + curved * (config.maxFrequency - config.minFrequency);
-    }
-
     function volumeToDecibels(volume) {
       return config.minSynthVolume + volume * (config.maxSynthVolume - config.minSynthVolume);
+    }
+
+    function noteToFrequency(note) {
+      return Tone.Frequency(note).toFrequency();
     }
 
     function smooth(current, next, amount) {
